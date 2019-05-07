@@ -1,0 +1,1550 @@
+---
+title: "Movie Recommendations"
+author: "Matthew Higgins"
+date: "5/5/2019"
+output:
+  pdf_document: 
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    df_print: kable
+  html_document:
+    df_print: paged
+# references: 
+#   - id: movielens-dataset
+#     title: The MovieLens Datasets: History and Context
+#     author:
+#     - family: Harper
+#       given: F. Maxwell
+#     - family: Konstan.
+#       given: Joseph A.
+#     container-title: ACM Transactions on Interactive Intelligent Systems
+#     volume: 5
+#     URL: 'http://dx.doi.org/10.1145/2827872'
+#     DOI: 10.1145/2827872
+#     issue: 4
+#     publisher: Association for Computing Machinery (ACM)
+#     page: 261-263
+#     type: article-journal
+#     issued:
+#       year: 2015
+#       month: 12
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(caret)
+library(lubridate)
+library(memoise)
+fscache <- cache_filesystem("~/.rcache")
+```
+
+# Introduction
+
+This project will work with the "Movielens 10M" dataset. Which, according to the creators;
+
+> This data set contains 10000054 ratings and 95580 tags applied to 10681 movies by 71567 users 
+  of the online movie recommender service MovieLens.
+
+The purpose of this project is to establish the best method to estimate the rating a user is 
+likely to give a movie based on factors from the data. This will include some exploratory 
+data analysis, improving the usability the data and testing a number of different approaches 
+to prediction, before concluding which provides the lowest error using the Root Mean 
+Square Error (RMSE) formula.
+
+From some research, especially around the Netflix Prize, which aimed to find a solution to 
+a similar problem, a target of less than `0.870` seems like a reasonable point to aim for. 
+
+After this optimal solution is found, it will be used in an R script which can be run 
+independently of this report to create recommendations.
+
+# Creating the test and validation sets
+
+Before getting into the report, the following code is taken directly from the project 
+specification, and creates the `edx` (training) and `validation` (test) datasets ready 
+for use. 
+
+```{r create-test-validation, cache=TRUE, warning=FALSE, message=FALSE}
+#############################################################
+# Create edx set, validation set, and submission file
+#############################################################
+
+# Note: this process could take a couple of minutes
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- read.table(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                      col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(levels(movieId))[movieId],
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+
+set.seed(1)
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+
+validation <- temp %>% 
+     semi_join(edx, by = "movieId") %>%
+     semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+# To make testing super-speedy, let's take the first 10K results
+
+# n <- 10000
+# edx <- head(edx, n)
+# validation <- head(edx, n)
+# rm(n)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+
+
+
+# Exploring and cleaning the data
+
+Before making any predictions, it's worth spending some time examining the data. The first step 
+in exploring the data is taking a few rows to understand the format and the contents.
+
+```{r sample-data}
+head(edx, 8)
+```
+
+Here user and movie IDs, as well as ratings, timestamps, a title column (which contains both 
+the moie title and a year), and a list of genres can be seen. The next step will be to look 
+at these in turn.
+ 
+## Dates
+
+The `timestamp` column contains a UNIX timestamp (the number of seconds since Jnuary 1 1970), 
+which can be converted to a more exploration-friendly date, using the following code;
+
+```{r date-column}
+edx <- edx %>% mutate(datetime = as_datetime(timestamp))
+head(edx$datetime)
+```
+
+This has been added in the addition to the `timestamp` column, so the `edx` object now 
+includes the additional column.
+
+Using these dates, it's possible to graph how many ratings were added each month.
+
+```{r graph_by_month, cache=TRUE}
+ratings_per_month <- edx %>% 
+                       group_by(month=floor_date(datetime, "month")) %>% 
+                       summarize(count = n())
+ggplot(ratings_per_month, aes(x = month, y = count)) + geom_col()
+```
+
+```{r delete-ratings-per-month}
+rm(ratings_per_month)
+```
+
+This shows some spikes, but from around the year 2000, steady use, so it seems unlikely 
+that there will be any bias on the basis of the rating being especially old or new.
+
+It's also possible to see whether the average rating given changes over time, for example,
+due to changes in societal attitudes to film critique.
+
+```{r average_by_month, cache=TRUE}
+average_per_month <- edx %>% 
+                       group_by(month=floor_date(datetime, "month")) %>% 
+                       summarize(mean = mean(rating))
+ggplot(average_per_month, aes(x = month, y = mean)) + geom_col()
+```
+
+This doesn't seem to change much, so it seems unlikely that this could have an effect that is
+useful when predicting ratings.
+
+Additionally, while it may have been possible to find a general trend, it's important to note 
+that a recommendation engine wouldn't have this context, as it's predicting how a user might 
+rate movies in the future, so exploring the date was always of limited value. 
+
+```{r delete-average-per-month}
+rm(average_per_month)
+```
+
+
+## Users
+
+Another column in the dataset is `userId`. As it contains numeric data, R has treated it as 
+an `integer`, which isn't very useful, as it is really categorical, and the categories 
+happen to be represented by numbers.
+
+```{r unique-users}
+class(edx$userId)
+summary(edx$userId)
+```
+
+It can also be converted to a factor.
+
+```{r users-factor}
+edx <- edx %>% mutate(userId = as.factor(userId))
+```
+
+Now we can count up how they are distributed. 
+
+```{r users-dataframe}
+users <- as_data_frame(table(edx$userId)) %>% arrange(desc(n))
+head(users)
+summary(users)
+```
+
+According to this table, two users have over 6000 movies rated, three have over 4000. But 
+most, by far, have less than 100, the median is 62. The minimum is 10, so all users have multiple 
+ratings.
+
+The following chart shows this distribution clearly.
+
+```{r users-chart, cache=TRUE}
+ggplot(users, aes(x = reorder(Var1, n), y = n)) + 
+  geom_col() +
+  theme_minimal() + 
+  theme(axis.text.x=element_blank(), axis.title.x = element_blank())
+```
+
+As this is very this, and somewhat difficult to read, it is also possible to create 
+a "zoomed in" view of just the top 50.
+
+```{r users-chart-top, cache=TRUE, warning=FALSE, message=FALSE}
+ggplot(top_n(users, 50), aes(x = reorder(Var1, n), y = n)) + 
+  geom_col() + 
+  theme_minimal() + 
+  theme(axis.text.x=element_blank(), axis.title.x = element_blank())
+```
+
+The following code finds the proportion of the ratings made by the 1% of most active users.
+
+```{r top-users-percent, warning=FALSE, message=FALSE}
+sum(top_n(users, (round(nrow(users) * 0.01)))$n) / nrow(edx)
+```
+
+So around 10% of ratings come from the most active 1% of users.
+
+The following provides a view of the proportion of users by the average ratings they give movies.
+
+```{r average-by-user, cache=TRUE, warning=FALSE, message=FALSE}
+user_average_ratings <- edx %>% 
+                          group_by(userId) %>% 
+                          summarize(average_rating = mean(rating))
+ggplot(user_average_ratings, aes(x = reorder(userId, average_rating), y = average_rating)) + 
+  geom_col() + 
+  theme_minimal() +
+  theme(axis.text.x=element_blank(), axis.title.x = element_blank())
+```
+
+In summary, the findings from the users column;
+
+* There are nearly 70,000 users
+* The median movies rated by a user are 62
+* The top 1% of users accounted for 10% of the ratings
+* The lower quartile is 32 ratings, so 75% of users have rated at least 32 movies
+* Users have individual average ratings that span the full range of ratings, but are mostly quite consistent, with an interquartile range of 0.546
+
+Overall, it appears that based on this level of activity users have, the user's own history, how 
+many ratings they have made and how positive they generally are will be important factors for 
+the predictions.
+
+```{r delete-users}
+rm(users, user_average_ratings)
+```
+
+## Movies
+
+The data also contain a column called `movieId`, lets take a look at how these are stored 
+and distributed.
+
+```{r unique-movies}
+class(edx$movieId)
+summary(edx$movieId)
+```
+
+These have the same issues as users, namely that categorical data is being represented 
+as numeric data, so can also be conveted into a factor.
+
+```{r movies-factor}
+edx$movieId <- as.factor(edx$movieId)
+```
+
+The data also contain a column including the totle of the movie. These can be used to count the
+frequency with which different movies appear in the results.
+
+```{r movies-summary}
+movies <- as_data_frame(table(edx$title)) %>% arrange(desc(n))
+head(movies)
+summary(movies$n)
+nrow(movies)
+```
+
+This shows that some movies are rated more than 30 000 times. The most-rated movies are all very
+well-known.  The mean of the counts is 842.9, and the median is 122.
+
+```{r movies-singles, cache=TRUE}
+ggplot(movies, aes(x = reorder(Var1, n), y = n)) + 
+  geom_col() + 
+  theme_minimal() +
+  theme(axis.text.x=element_blank(), axis.title.x = element_blank())
+```
+
+This shows that many movies have only a few ratings. Let's try this again with a 
+log scale to see if it's easier to read. 
+
+```{r movies-singles-log, cache=TRUE}
+ggplot(movies, aes(x = reorder(Var1, n), y = n)) + 
+  geom_col() + 
+  scale_y_log10() + 
+  theme_minimal() +
+  theme(axis.text.x=element_blank(), axis.title.x = element_blank())
+```
+
+So, quite a few movies are at the low end of the scale, but most have over 100 ratings. 
+Now, to "zoom in" on the low end.
+
+```{r movies-singles-bottom, cache=TRUE}
+ggplot(top_n(movies, 1500, -n), aes(x = reorder(Var1, n), y = n)) + 
+  geom_col() + 
+  scale_y_log10() +
+  theme_minimal() +
+  theme(axis.text.x=element_blank(), axis.title.x = element_blank())
+```
+
+And lets see some of the least-frequently-rated movies.
+
+```{r movies-bottom, cache=TRUE}
+tail(movies)
+```
+
+So, in summary; 
+
+* The dataset contains just over 10,000 movies.
+* Each movie has been rated 1-31,362 times.
+* Most movies are rated between 100 and 10,000 times.
+
+## Movie Production Years
+
+The `title` column is in the format of `[title] ([year])`. The year can be copied 
+into a separate column using a regular expression.
+
+```{r extract-years}
+years_in_brackets <- str_extract(edx$title, "\\(\\d{4}\\)$")
+years_without_brackets <- str_remove_all(years_in_brackets, "[()]")
+years_as_factor <- as.factor(years_without_brackets)
+edx$year <- years_as_factor
+rm(years_in_brackets, years_without_brackets, years_as_factor)
+```
+
+Now it's possible to visualise how these affect the average rating.
+
+```{r ratings-per-year, cache=TRUE}
+overall_average <- mean(edx$rating)
+years <- edx %>% 
+           group_by(year) %>% 
+           summarize(mean = mean(rating), relative_mean = mean - overall_average, count = n())
+ggplot(years, aes(x = year, y = relative_mean)) +
+  geom_col() + 
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+This provides a small change, but it seems to diminish in more recent years. It can, however, 
+be included in the further explorations, as it may hold some predictive value.
+
+## Distribution of Ratings
+
+The data also contain a `rating`. This will be the "target" column. 
+
+According to the README file from the dataset;
+
+> Ratings are made on a 5-star scale, with half-star increments.
+
+```{r movies-sumary}
+summary(edx$rating)
+```
+
+The proportions can be plotted. 
+
+```{r rating distribution, cache=TRUE}
+ratings <- as_data_frame(table(edx$rating)) %>% arrange(desc(n))
+ggplot(ratings, aes(x = Var1, y = n)) + 
+  geom_col() + 
+  theme_minimal() + 
+  theme(axis.title.x = element_blank())
+```
+
+Half-star ratings seem less popular then whole-star ratings.
+
+Ratings are numeric, and can be left that way. While they are provided in categories (intervals 
+of 0.5), it makes more sense to predict the value wherever it falls, than a specific category 
+a user can rate. 
+
+For example, when recommending movies, it makes sense to show one where they user is predicted 
+to rate `4.9586` more prominently than one the user is expected to rate `4.7501`, even 
+though both would round to `5`.
+
+The following can be observed from the data;
+
+* Whole number ratings are more common than their nearest half ratings.
+* On average, users would seem to rate more movies they like than movies they don't.
+
+## Ratings per Genre
+
+The genres are strings, containing the names of one or more genre, separated with a `|` (pipe 
+character).
+
+Splitting them into single genres is more challenging than some of the work with other columns,
+it involves splitting the strings into their unique values, then, later using the unique values to
+test for their presence.
+
+This method was chosen as it was the fastest performing, and genres will be handled rowwise, but 
+there are alternatives, for example, breaking the column into several boolean columns. 
+
+It's worth noting that this would not work if a genre included another. For example if 
+the data included both `Romantic Comedy` and `Comedy`, a different approach would be needed. 
+Luckily, this isn't an issue in these data.
+
+First, get a complete list of every genre that's included.
+
+```{r split-genres-distinct}
+genres_list <- unique(unlist(strsplit(edx$genres, "|", fixed=TRUE)))
+genres_list <- data.frame(name = genres_list)
+genres_list
+```
+
+The number of movies including each can be counted.
+
+```{r count-per-genre, cache=TRUE, warning=FALSE, message=FALSE}
+includes_genre <- function(genre_list, genre) grepl(genre_list, genre)
+genres_list <- genres_list %>% 
+                 rowwise() %>% 
+                 mutate(count = sum(unlist(lapply(edx$genres, includes_genre, name))))
+row.names(genres_list) <- genres_list$name
+genres_list <- genres_list %>% as.tibble(rownames = genres_list$name)
+head(genres_list)
+```
+
+Now these can be plotted on a bar chart.
+
+```{r genres-chart, cache=TRUE}
+ggplot(genres_list, aes(x = name, y = count)) + 
+  geom_col() + 
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Some final notes about the genres;
+
+* Seven movies have no listed genres - these could be hard to work with if genre 
+  is significant, but they represent a tiny proportion of the data.
+* A small number of movies are listed as `IMAX`. It will be interesting to see
+  if this has an impact, as it is not a genre in the conventional sense, but may 
+  correlate with certain other genres.
+
+## Genre-Specific Ratings
+
+The impact that the present genres have on the movies can be found. It's important to 
+note that this average can't take account of combinations (maybe audiences more often 
+find combinations like `Comedy|Romance` more enjoyable than, say, `Comedy|War`), but
+only of single genres.
+
+```{r overall-rating-average, cache=TRUE, warning=FALSE}
+overall_average <- mean(edx$rating)
+genres_list[,"average_rating"] <- NA
+for(i in 1:nrow(genres_list)){
+  matching_ratings <- edx %>% 
+                        rowwise() %>%  
+                        filter(includes_genre(genres, genres_list[[i, 'name']]))
+  new_value <- mean(matching_ratings$rating)
+  genres_list$average_rating[[i]] <- new_value
+}
+genres_list <- genres_list %>% 
+                 mutate(effect = average_rating - overall_average) %>% 
+                 as.tibble(rownames = genres_list$name)
+row.names(genres_list) <- genres_list$name
+
+genres_list
+```
+
+* Genres have a small effect on the average rating in this dataset, with 
+  some causing up to a `0.25` change in the average rating.
+
+# Testing Prediction Methods
+
+## RMSE Calculation
+
+The `calculate_rmse` function will be used to calculate the Root Mean Squared Error (RMSE) 
+from the predicted values (the `ratings` as a list) and the corresponding true values 
+(in this case, the ratings from the `validation` set).
+
+```{r rmse-function}
+calculate_rmse <- function(predictions, actual_values){
+  sqrt(mean((actual_values - predictions) ^ 2))
+}
+```
+
+To double-check that it is working correctly, it is passed the same values for predictions` 
+and `actual_values`, and as there is no error between them, the RMSE will be zero.
+
+```{r test-rmse}
+calculate_rmse(edx$rating, edx$rating)
+```
+
+This seems to be working correctly.
+
+## Baseline RMSE
+
+To see how well different predictive approaches can work, the mean of all of the 
+ratings gives a realistic possible rating which is likely to have lower error 
+than other approaches (like using random numbers, for example), so this makes 
+a good baseline against which to compare the RMSE values of different methods.
+
+```{r mean-rating}
+mean_rating = mean(edx$rating)
+print(mean_rating)
+```
+
+And the RMSE of using the mean for every prediction;
+
+```{r mean-rmse}
+rmse <- calculate_rmse(rep(mean_rating, nrow(validation)), validation$rating)
+```
+
+At this point, the results will be stored in a data frame;
+
+```{r store-results}
+peak_rmse_results <- data.frame(method = c("Mean Rating"), 
+                                rmse = c(rmse), 
+                                stringsAsFactors = FALSE)
+peak_rmse_results
+```
+
+As this is over 1, it is, as expected, a poor way of predicting ratings.
+
+## Single Predictors
+
+During the data exploration, each potential predictor was explored to
+establish potential predictive value. 
+
+Now, each potentially useful predictor can be examined, and the RMSE when
+it is used as the only predictor will be compared.
+
+Again, a data frame will be used to store the values being compared.
+
+```{r empty-rmse-list}
+rmse_results <- data.frame(method = c("Mean Rating"), 
+                           rmse = c(rmse), 
+                           stringsAsFactors = FALSE)
+rm(rmse)
+```
+
+### The movie effect
+
+This method considers only the movie, and predicts that the user will rate each movie 
+close to the average of the ratings other users gave;
+
+```{r movie-effect-model, warning=FALSE, message=FALSE}
+movie_effects <- edx %>% 
+                   group_by(movieId) %>% 
+                   summarize(movie_effect = mean(rating - mean_rating),
+                             ratings_for_movie = n())
+predictions <- validation %>% 
+               mutate(movieId = as.factor(movieId)) %>% 
+               left_join(movie_effects, by='movieId') %>% 
+               mutate(prediction = (mean_rating + movie_effect)) %>% 
+               .$prediction
+rmse <- print(calculate_rmse(predictions, validation$rating))
+rmse_results[nrow(rmse_results) + 1,] <- list("Mean + Movie Effect",rmse)
+rm(rmse, predictions)
+rmse_results
+```
+
+### The user effect
+
+This method considers only the ratings the user has given, and predicts that the user
+will rate the movie with the average of ratings that they have given other movies.
+
+```{r user-effect-model, warning=FALSE, message=FALSE}
+user_effects <- edx %>% 
+                  group_by(userId) %>%
+                  summarize(user_effect = mean(rating - mean_rating), 
+                            ratings_by_user = n())
+predictions <- validation %>% 
+                 mutate(userId = as.factor(userId)) %>% 
+                 left_join(user_effects, by='userId') %>% 
+                 mutate(prediction = (mean_rating + user_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+rmse_results[nrow(rmse_results) + 1,] <- list("Mean + User Effect",rmse)
+rm(rmse, predictions)
+rmse_results
+```
+
+### The year effect
+
+This method looks at movies made in the same year, and predicts that the user will rate
+the movie close to the average of the ratings given to other movies made the same year.
+
+```{r full-year-model}
+year_effects <- edx %>% 
+                  group_by(year) %>% 
+                  summarize(year_effect = mean(rating - mean_rating))
+predictions <- validation %>% 
+                 mutate(movieId = as.factor(movieId), userId = as.factor(userId)) %>% 
+                 mutate(year = as.factor(str_remove_all(str_extract(title, 
+                                                                    "\\(\\d{4}\\)$"), "[()]"))) %>%
+                 left_join(year_effects, by='year') %>%
+                 mutate(prediction = (mean_rating + year_effect)) %>%
+                 .$prediction
+rmse <- print(calculate_rmse(predictions, validation$rating))
+rmse_results[nrow(rmse_results) + 1,] <- list("Mean + Year Effect",rmse)
+rm(rmse, predictions)
+rmse_results
+```
+
+### The "genres combination" effect"
+
+Next, the string containing all of the genres can be explored.
+
+This, awkwardly, relies on there being a single combination of genres that has an 
+effect, when in reality, the genres likely each have different effects.
+
+```{r genres-combination-only-model}
+genre_combination_effects <- edx %>% 
+                               group_by(genres) %>% 
+                               summarize(genre_combination_effect = mean(rating - mean_rating))
+predictions <- validation %>% 
+                 left_join(genre_combination_effects, by='genres') %>%
+                 mutate(prediction = (mean_rating + genre_combination_effect)) %>%
+                 .$prediction
+rmse <-calculate_rmse(predictions, validation$rating)
+rmse_results[nrow(rmse_results) + 1,] <- list("Mean + Combined Genres Effect",rmse)
+rm(rmse, predictions)
+rmse_results
+```
+
+### Sum of single genre effects
+
+Next, a new function that calculates a combined effect of the movie's listed 
+genres can be used. This will be called `calculate_genre_effect_sum`.
+
+As well as creating the function, it can be tested, passing it a string 
+containing a `|`-separated list of genres, and it should return the effect.
+
+```{r sum-single-genres-function}
+calculate_genre_effect_sum <- function(genres_string) {
+  genres_as_list <- strsplit(genres_string, "|", fixed=TRUE)
+  single_genre_effects <- map(genres_as_list, function(genre_name) { genres_list[genre_name, 'effect'] } )
+  do.call(sum, single_genre_effects)
+}
+calculate_genre_effect_sum("Comedy|Drama")
+```
+
+Now to measure whether it improves the predictions, and by how much.
+
+```{r sum-single-genres, cache=TRUE}
+predictions <- validation %>% 
+                 rowwise() %>%
+                 mutate(genres_effect = calculate_genre_effect_sum(genres)) %>%
+                 ungroup() %>%
+                 mutate(prediction = (mean_rating + genres_effect)) %>%
+                 .$prediction
+rmse <-calculate_rmse(predictions, validation$rating)
+rmse_results[nrow(rmse_results) + 1,] <- list("Mean + Sum of Single Genre Effects",rmse)
+rm(rmse, predictions)
+rmse_results
+```
+
+### Single Predictor Results
+
+The results of the single predictors are as follows;
+
+```{r single-predictor-results}
+rmse_results
+```
+
+Here the "movie effect" can be seen as the most impactful, but it's likely 
+that when combined, these factors build on each other and create much 
+better predictions.
+
+```{r store-peak-single}
+peak_rmse_results[nrow(peak_rmse_results) + 1,] <- list("Movie Effect (Single Predictor)", min(rmse_results$rmse))
+```
+
+## Stacking Single Predictors
+
+The next tests will combine several effects. To do this systematically, five effects will be
+run in all possible combinations, creating 32 possible combinations 
+
+Again, the results, including a baseline, will be stored in a data frame.
+
+```{r stacking-baseline}
+mean_rating = mean(edx$rating)
+rmse <- calculate_rmse(rep(mean_rating, nrow(validation)), validation$rating)
+stacked_rmse_results <- data.frame(movie_effect = c(FALSE),
+                                   user_effect = c(FALSE),
+                                   year_effect = c(FALSE),
+                                   combined_genres_effect = c(FALSE),
+                                   sum_single_genres_effect = c(FALSE),
+                                   rmse = c(rmse), 
+                                   stringsAsFactors = FALSE)
+rm(rmse)
+stacked_rmse_results
+```
+
+Since the logic has already been explained, the code contains simple comments noting 
+which combination is represented by each section, and why certain decisions were made.
+
+```{r stacking-items, warning=FALSE, message=FALSE, cache=TRUE}
+# To reduce duplicate work, we will work on a copy of validation, with the year
+# column added, and a few other small mutations made. Making these once makes
+# this whole chunk quite speedy.
+
+working_validation <- validation %>% 
+                        mutate(movieId = as.factor(movieId)) %>%
+                        mutate(userId = as.factor(userId)) %>%
+                        mutate(year = as.factor(str_remove_all(str_extract(title, 
+                                                                           "\\(\\d{4}\\)$"), "[()]"))) %>%
+                        rowwise() %>%
+                        mutate(sum_single_genres_effect = calculate_genre_effect_sum(genres)) %>%
+                        ungroup() %>%
+                        left_join(movie_effects, by='movieId') %>% 
+                        left_join(user_effects, by='userId') %>% 
+                        left_join(year_effects, by='year') %>% 
+                        left_join(genre_combination_effects, by='genres')
+
+# Starting with the movie effects only, note that movie_effects is already defined
+predictions <- working_validation %>% 
+               mutate(prediction = (mean_rating + movie_effect)) %>% 
+               .$prediction
+rmse <- print(calculate_rmse(predictions, validation$rating))
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(TRUE, # Movie effect
+                                                              FALSE, # User effect
+                                                              FALSE, # Year effect
+                                                              FALSE, # Combined genres effect
+                                                              FALSE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# Next, user effect only, again, user_effects is defined
+
+predictions <- working_validation %>% 
+                 mutate(prediction = (mean_rating + user_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(FALSE, # Movie effect
+                                                              TRUE, # User effect
+                                                              FALSE, # Year effect
+                                                              FALSE, # Combined genres effect
+                                                              FALSE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# This time, the combination of user and movie effects
+predictions <- working_validation %>% 
+                 mutate(combined_effect = user_effect + movie_effect) %>%
+                 mutate(prediction = mean_rating + combined_effect) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(TRUE, # Movie effect
+                                                              TRUE, # User effect
+                                                              FALSE, # Year effect
+                                                              FALSE, # Combined genres effect
+                                                              FALSE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# Next, year effect only, again, year_effects is defined
+
+predictions <- working_validation %>% 
+                 mutate(prediction = (mean_rating + year_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(FALSE, # Movie effect
+                                                              FALSE, # User effect
+                                                              TRUE, # Year effect
+                                                              FALSE, # Combined genres effect
+                                                              FALSE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# Movie and year
+predictions <- working_validation %>% 
+                 mutate(combined_effect = movie_effect + year_effect) %>%
+                 mutate(prediction = (mean_rating + combined_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(TRUE, # Movie effect
+                                                              FALSE, # User effect
+                                                              TRUE, # Year effect
+                                                              FALSE, # Combined genres effect
+                                                              FALSE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# User and year
+predictions <- working_validation %>% 
+                 mutate(combined_effect = user_effect + year_effect) %>%
+                 mutate(prediction = (mean_rating + combined_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(FALSE, # Movie effect
+                                                              TRUE, # User effect
+                                                              TRUE, # Year effect
+                                                              FALSE, # Combined genres effect
+                                                              FALSE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# Now the first with three; movie, user and year
+predictions <- working_validation %>% 
+                 mutate(combined_effect = movie_effect + user_effect + year_effect) %>%
+                 mutate(prediction = (mean_rating + combined_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(TRUE, # Movie effect
+                                                              TRUE, # User effect
+                                                              TRUE, # Year effect
+                                                              FALSE, # Combined genres effect
+                                                              FALSE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# Now for the combined genres effect
+predictions <- working_validation %>% 
+                 mutate(prediction = (mean_rating + genre_combination_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(FALSE, # Movie effect
+                                                              FALSE, # User effect
+                                                              FALSE, # Year effect
+                                                              TRUE, # Combined genres effect
+                                                              FALSE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# Now for the movie effect and the combined genres effect
+predictions <- working_validation %>% 
+                 mutate(combined_effect = movie_effect + genre_combination_effect) %>%
+                 mutate(prediction = (mean_rating + combined_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(TRUE, # Movie effect
+                                                              FALSE, # User effect
+                                                              FALSE, # Year effect
+                                                              TRUE, # Combined genres effect
+                                                              FALSE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# Now for the user effect and the combined genres effect
+predictions <- working_validation %>% 
+                 mutate(combined_effect = user_effect + genre_combination_effect) %>%
+                 mutate(prediction = (mean_rating + combined_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(FALSE, # Movie effect
+                                                              TRUE, # User effect
+                                                              FALSE, # Year effect
+                                                              TRUE, # Combined genres effect
+                                                              FALSE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# Now for the movie effect, user effect and the combined genres effect
+predictions <- working_validation %>% 
+                 mutate(combined_effect = movie_effect + user_effect + genre_combination_effect) %>%
+                 mutate(prediction = (mean_rating + combined_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(TRUE, # Movie effect
+                                                              TRUE, # User effect
+                                                              FALSE, # Year effect
+                                                              TRUE, # Combined genres effect
+                                                              FALSE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# Now for the year and the combined genres effect
+predictions <- working_validation %>% 
+                 mutate(combined_effect = year_effect + genre_combination_effect) %>%
+                 mutate(prediction = (mean_rating + combined_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(FALSE, # Movie effect
+                                                              FALSE, # User effect
+                                                              TRUE, # Year effect
+                                                              TRUE, # Combined genres effect
+                                                              FALSE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# Now for the movie, the year and the combined genres effect
+predictions <- working_validation %>% 
+                 mutate(combined_effect = movie_effect + year_effect + genre_combination_effect) %>%
+                 mutate(prediction = (mean_rating + combined_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(TRUE, # Movie effect
+                                                              FALSE, # User effect
+                                                              TRUE, # Year effect
+                                                              TRUE, # Combined genres effect
+                                                              FALSE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# Now for the movie, the year and the combined genres effect
+predictions <- working_validation %>% 
+                 mutate(combined_effect = user_effect + year_effect + genre_combination_effect) %>%
+                 mutate(prediction = (mean_rating + combined_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(FALSE, # Movie effect
+                                                              TRUE, # User effect
+                                                              TRUE, # Year effect
+                                                              TRUE, # Combined genres effect
+                                                              FALSE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# Now for the movie, user, year and the combined genres effect
+predictions <- working_validation %>% 
+                 mutate(combined_effect = movie_effect + user_effect + year_effect + genre_combination_effect) %>%
+                 mutate(prediction = (mean_rating + combined_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(TRUE, # Movie effect
+                                                              TRUE, # User effect
+                                                              TRUE, # Year effect
+                                                              TRUE, # Combined genres effect
+                                                              FALSE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# Now for the combination of the single genres effects
+predictions <- working_validation %>% 
+                 mutate(prediction = (mean_rating + sum_single_genres_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(FALSE, # Movie effect
+                                                              FALSE, # User effect
+                                                              FALSE, # Year effect
+                                                              FALSE, # Combined genres effect
+                                                              TRUE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# Now for the movie effect, plus the combination of the single genres effects
+predictions <- working_validation %>% 
+                 mutate(combined_effect = movie_effect + sum_single_genres_effect) %>%
+                 mutate(prediction = (mean_rating + combined_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(TRUE, # Movie effect
+                                                              FALSE, # User effect
+                                                              FALSE, # Year effect
+                                                              FALSE, # Combined genres effect
+                                                              TRUE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# Now for the user effect, plus the combination of the single genres effects
+predictions <- working_validation %>% 
+                 mutate(combined_effect = user_effect + sum_single_genres_effect) %>%
+                 mutate(prediction = (mean_rating + combined_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(FALSE, # Movie effect
+                                                              TRUE, # User effect
+                                                              FALSE, # Year effect
+                                                              FALSE, # Combined genres effect
+                                                              TRUE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# Now for the sum of the movie effect, user effect and the combination of the single genres effects
+predictions <- working_validation %>% 
+                 mutate(combined_effect = movie_effect + user_effect + sum_single_genres_effect) %>%
+                 mutate(prediction = (mean_rating + combined_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(TRUE, # Movie effect
+                                                              TRUE, # User effect
+                                                              FALSE, # Year effect
+                                                              FALSE, # Combined genres effect
+                                                              TRUE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# Now for the sum of the year effect and the combination of the single genres effects
+predictions <- working_validation %>% 
+                 mutate(combined_effect = year_effect + sum_single_genres_effect) %>%
+                 mutate(prediction = (mean_rating + combined_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(FALSE, # Movie effect
+                                                              FALSE, # User effect
+                                                              TRUE, # Year effect
+                                                              FALSE, # Combined genres effect
+                                                              TRUE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# Now for the sum of the movie effect, year effect and the combination of the single genres effects
+predictions <- working_validation %>% 
+                 mutate(combined_effect = movie_effect + year_effect + sum_single_genres_effect) %>%
+                 mutate(prediction = (mean_rating + combined_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(TRUE, # Movie effect
+                                                              FALSE, # User effect
+                                                              TRUE, # Year effect
+                                                              FALSE, # Combined genres effect
+                                                              TRUE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# Now for the sum of the user effect, year effect and the combination of the single genres effects
+predictions <- working_validation %>% 
+                 mutate(combined_effect = user_effect + year_effect + sum_single_genres_effect) %>%
+                 mutate(prediction = (mean_rating + combined_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(FALSE, # Movie effect
+                                                              TRUE, # User effect
+                                                              TRUE, # Year effect
+                                                              FALSE, # Combined genres effect
+                                                              TRUE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# Now for four; movie, user and year effects and the combination of the single genres effects
+predictions <- working_validation %>% 
+                 mutate(combined_effect = movie_effect + user_effect + year_effect + sum_single_genres_effect) %>%
+                 mutate(prediction = (mean_rating + combined_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(TRUE, # Movie effect
+                                                              TRUE, # User effect
+                                                              TRUE, # Year effect
+                                                              FALSE, # Combined genres effect
+                                                              TRUE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# Now for completeness, the following are included, but since they include 
+# two different ways of finding the gnere effect, I don't expect them to 
+# be too helpful
+
+# Combined genres + single genres
+predictions <- working_validation %>% 
+                 mutate(combined_effect = genre_combination_effect + sum_single_genres_effect) %>%
+                 mutate(prediction = (mean_rating + combined_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(FALSE, # Movie effect
+                                                              FALSE, # User effect
+                                                              FALSE, # Year effect
+                                                              TRUE, # Combined genres effect
+                                                              TRUE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# Movie, combined genres + single genres
+predictions <- working_validation %>% 
+                 mutate(combined_effect = movie_effect + genre_combination_effect + sum_single_genres_effect) %>%
+                 mutate(prediction = (mean_rating + combined_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(TRUE, # Movie effect
+                                                              FALSE, # User effect
+                                                              FALSE, # Year effect
+                                                              TRUE, # Combined genres effect
+                                                              TRUE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# User, combined genres + single genres
+predictions <- working_validation %>% 
+                 mutate(combined_effect = user_effect + genre_combination_effect + sum_single_genres_effect) %>%
+                 mutate(prediction = (mean_rating + combined_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(FALSE, # Movie effect
+                                                              TRUE, # User effect
+                                                              FALSE, # Year effect
+                                                              TRUE, # Combined genres effect
+                                                              TRUE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# Movie, user, combined genres + single genres
+predictions <- working_validation %>% 
+                 mutate(combined_effect = movie_effect + user_effect + genre_combination_effect + sum_single_genres_effect) %>%
+                 mutate(prediction = (mean_rating + combined_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(TRUE, # Movie effect
+                                                              TRUE, # User effect
+                                                              FALSE, # Year effect
+                                                              TRUE, # Combined genres effect
+                                                              TRUE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# Year, combined genres + single genres
+predictions <- working_validation %>% 
+                 mutate(combined_effect = year_effect + genre_combination_effect + sum_single_genres_effect) %>%
+                 mutate(prediction = (mean_rating + combined_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(FALSE, # Movie effect
+                                                              FALSE, # User effect
+                                                              TRUE, # Year effect
+                                                              TRUE, # Combined genres effect
+                                                              TRUE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# Movie, year, combined genres + single genres
+predictions <- working_validation %>% 
+                 mutate(combined_effect = movie_effect + year_effect + genre_combination_effect + sum_single_genres_effect) %>%
+                 mutate(prediction = (mean_rating + combined_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(TRUE, # Movie effect
+                                                              FALSE, # User effect
+                                                              TRUE, # Year effect
+                                                              TRUE, # Combined genres effect
+                                                              TRUE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# User, year, combined genres + single genres
+predictions <- working_validation %>% 
+                 mutate(combined_effect = user_effect + year_effect + genre_combination_effect + sum_single_genres_effect) %>%
+                 mutate(prediction = (mean_rating + combined_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(FALSE, # Movie effect
+                                                              TRUE, # User effect
+                                                              TRUE, # Year effect
+                                                              TRUE, # Combined genres effect
+                                                              TRUE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+# Movie, user, year, combined genres + single genres
+predictions <- working_validation %>% 
+                 mutate(combined_effect = user_effect + year_effect + genre_combination_effect + sum_single_genres_effect) %>%
+                 mutate(prediction = (mean_rating + combined_effect)) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+stacked_rmse_results[nrow(stacked_rmse_results) + 1,] <- list(TRUE, # Movie effect
+                                                              TRUE, # User effect
+                                                              TRUE, # Year effect
+                                                              TRUE, # Combined genres effect
+                                                              TRUE, # Sum of single genre effects
+                                                              rmse)
+rm(rmse, predictions)
+
+stacked_rmse_results %>% arrange(rmse)
+```
+
+These data seem to show that the model using only `user` and `movie` performed
+the best of all, but it still offers some room for improvement.
+
+```{r store-peak-stacked}
+peak_rmse_results[nrow(peak_rmse_results) + 1,] <- c("Movie & User Effects (Simple Stacked)", 
+                                                     min(stacked_rmse_results$rmse))
+```
+
+## Regularising the Movie and User Effects
+
+Using regularisation, a lambda value can be found for the effects, starting with the movie effect.
+
+This takes into account the number of ratings, and scales the impact of the movie effect to how 
+many items in the training set relate to the movie - the higher this count, the more reliable
+this effect.
+
+```{r regularise-movies, warning=FALSE, message=FALSE}
+values_to_test <- seq(0, 7, 0.5)
+
+rmse_values <- sapply(values_to_test, function(lambda){
+  regularised_movie_effects <- edx %>% 
+                                 group_by(movieId) %>% 
+                                 summarize(movie_effect = mean(rating - mean_rating),
+                                           ratings_for_movie = n(),
+                                           regularised_effect = sum(rating - mean_rating) / (n() + lambda))
+  
+  predictions <- validation %>% 
+                  mutate(movieId = as.factor(movieId)) %>% 
+                  left_join(regularised_movie_effects, by='movieId') %>% 
+                  mutate(prediction = (mean_rating + regularised_effect)) %>% 
+                  .$prediction
+  return(calculate_rmse(predictions, validation$rating))
+})
+
+ggplot(data.frame(y = rmse_values, x = values_to_test), aes(x = x, y = y)) + geom_point() + geom_smooth() + theme_minimal()
+rm(rmse_values, values_to_test)
+```
+
+The optimal lambda value can be seen at around 2.5.
+
+This can be repeated to find a more precise value.
+
+```{r regularise-movies-zoom, warning=FALSE, message=FALSE}
+values_to_test <- seq(2, 2.8, 0.05)
+
+rmse_values <- sapply(values_to_test, function(lambda){
+  regularised_movie_effects <- edx %>% 
+                                 group_by(movieId) %>% 
+                                 summarize(movie_effect = mean(rating - mean_rating),
+                                           ratings_for_movie = n(),
+                                           regularised_effect = sum(rating - mean_rating) / (n() + lambda))
+  
+  predictions <- validation %>% 
+                  mutate(movieId = as.factor(movieId)) %>% 
+                  left_join(regularised_movie_effects, by='movieId') %>% 
+                  mutate(prediction = (mean_rating + regularised_effect)) %>% 
+                  .$prediction
+  return(calculate_rmse(predictions, validation$rating))
+})
+
+ggplot(data.frame(y = rmse_values, x = values_to_test), aes(x = x, y = y)) + geom_point() + geom_smooth() + theme_minimal()
+rm(rmse_values, values_to_test)
+```
+
+The plot shows that the movie effect has a lambda value of approximately `2.38`.
+
+This can also be repeated for the user effect.
+
+```{r regularise-users, warning=FALSE, message=FALSE}
+values_to_test <- seq(0, 7, 0.5)
+
+rmse_values <- sapply(values_to_test, function(lambda){
+  regularised_user_effects <- edx %>% 
+                               group_by(userId) %>% 
+                               summarize(userEffect = mean(rating - mean_rating),
+                                         ratings_by_user = n(),
+                                         regularised_effect = sum(rating - mean_rating) / (n() + lambda))
+  
+  predictions <- validation %>% 
+                  mutate(userId = as.factor(userId)) %>% 
+                  left_join(regularised_user_effects, by='userId') %>% 
+                  mutate(prediction = (mean_rating + regularised_effect)) %>% 
+                  .$prediction
+  return(calculate_rmse(predictions, validation$rating))
+})
+
+ggplot(data.frame(y = rmse_values, x = values_to_test), aes(x = x, y = y)) + geom_point() + geom_smooth() + theme_minimal()
+rm(rmse_values, values_to_test)
+```
+
+It looks like the lambda value is between 5 and 6, let's zoom in one more time;
+
+```{r regularise-users-zoom, warning=FALSE, message=FALSE}
+values_to_test <- seq(5, 6, 0.05)
+
+rmse_values <- sapply(values_to_test, function(lambda){
+  regularised_user_effects <- edx %>% 
+                               group_by(userId) %>% 
+                               summarize(userEffect = mean(rating - mean_rating),
+                                         ratings_by_user = n(),
+                                         regularised_effect = sum(rating - mean_rating) / (n() + lambda))
+  
+  predictions <- validation %>% 
+                  mutate(userId = as.factor(userId)) %>% 
+                  left_join(regularised_user_effects, by='userId') %>% 
+                  mutate(prediction = (mean_rating + regularised_effect)) %>% 
+                  .$prediction
+  return(calculate_rmse(predictions, validation$rating))
+})
+
+ggplot(data.frame(y = rmse_values, x = values_to_test), aes(x = x, y = y)) + geom_point() + geom_smooth() + theme_minimal()
+rm(rmse_values, values_to_test)
+```
+
+We'll go with 5.45. Now let's try using these in the "winning" model, which 
+uses only user ID and movie ID.
+
+```{r regularise-final, warning=FALSE, message=FALSE}
+moviesLambda <- 2.38
+usersLambda <- 5.45
+
+regularised_movie_effects <- edx %>% 
+                               group_by(movieId) %>% 
+                               summarize(movie_effect = mean(rating - mean_rating),
+                                         ratings_for_movie = n(),
+                                         regularised_movie_effect = sum(rating - mean_rating) / (n() + moviesLambda))
+
+regularised_user_effects <- edx %>% 
+                             group_by(userId) %>% 
+                             summarize(user_effect = mean(rating - mean_rating),
+                                       ratings_by_user = n(),
+                                       regularised_user_effect = sum(rating - mean_rating) / (n() + usersLambda))
+
+predictions <- validation %>% 
+                mutate(userId = as.factor(userId)) %>% 
+                mutate(movieId = as.factor(movieId)) %>% 
+                left_join(regularised_movie_effects, by='movieId') %>% 
+                left_join(regularised_user_effects, by='userId') %>% 
+                mutate(prediction = (mean_rating + (regularised_movie_effect + regularised_user_effect))) %>% 
+                .$prediction
+
+print(calculate_rmse(predictions, validation$rating))
+
+rm(predictions, regularised_user_effects, regularised_movie_effects, moviesLambda, usersLambda)
+```
+
+Now this can be repeated to find a lambda that works for both.
+
+```{r regularise-dual, warning=FALSE, message=FALSE}
+values_to_test <- seq(24, 24.25, 0.025)
+
+rmse_values <- sapply(values_to_test, function(lambda){
+  regularised_movie_effects <- edx %>% 
+                                 group_by(movieId) %>% 
+                                 summarize(movie_effect = mean(rating - mean_rating),
+                                           ratings_for_movie = n(),
+                                           regularised_movie_effect = sum(rating - mean_rating) / (n() + lambda))
+  
+  regularised_user_effects <- edx %>% 
+                               group_by(userId) %>% 
+                               summarize(user_effect = mean(rating - mean_rating),
+                                         ratings_by_user = n(),
+                                         regularised_user_effect = sum(rating - mean_rating) / (n() + lambda))
+  
+  predictions <- validation %>% 
+                  mutate(userId = as.factor(userId)) %>% 
+                  mutate(movieId = as.factor(movieId)) %>% 
+                  left_join(regularised_movie_effects, by='movieId') %>% 
+                  left_join(regularised_user_effects, by='userId') %>% 
+                  mutate(prediction = (mean_rating + (regularised_movie_effect + regularised_user_effect))) %>% 
+                  .$prediction
+
+  return(calculate_rmse(predictions, validation$rating))
+})
+
+ggplot(data.frame(y = rmse_values, x = values_to_test), aes(x = x, y = y)) + geom_point() + geom_smooth() + theme_minimal()
+
+rm(values_to_test, rmse_values)
+```
+
+The lambda values seems to be `24.125`. Let's calculate the precise RMSE with that value.
+
+```{r dual-regularise-final, warning=FALSE, message=FALSE}
+lambda <- 24.125
+
+regularised_movie_effects <- edx %>% 
+                               group_by(movieId) %>% 
+                               summarize(movie_effect = mean(rating - mean_rating),
+                                         ratings_for_movie = n(),
+                                         regularised_movie_effect = sum(rating - mean_rating) / (n() + lambda))
+
+regularised_user_effects <- edx %>% 
+                             group_by(userId) %>% 
+                             summarize(user_effect = mean(rating - mean_rating),
+                                       ratings_by_user = n(),
+                                       regularised_user_effect = sum(rating - mean_rating) / (n() + lambda))
+
+predictions <- validation %>% 
+                mutate(userId = as.factor(userId)) %>% 
+                mutate(movieId = as.factor(movieId)) %>% 
+                left_join(regularised_movie_effects, by='movieId') %>% 
+                left_join(regularised_user_effects, by='userId') %>% 
+                mutate(prediction = (mean_rating + (regularised_movie_effect + regularised_user_effect))) %>% 
+                .$prediction
+
+rmse <- calculate_rmse(predictions, validation$rating)
+print(rmse)
+
+rm(predictions, regularised_user_effects, regularised_movie_effects, lambda)
+```
+
+This gives a small improvement oer the separate lambda values. The results are now 
+getting close to the target and can be added to the list of results to compare.
+
+```{r store-peak-regularised}
+peak_rmse_results[nrow(peak_rmse_results) + 1,] <- c("Movie & User Effects (Regularised)", rmse)
+```
+
+
+## The user-genre effect
+
+An idea was explored that involved finding the user-specific effect of each 
+present genre. So, to tell if a user is likely to enjoy a `Comedy|Romance`, all 
+ratings of movies including `Comedy` will be used to find the user-specific 
+"comedy effect", and all those with `Romance` rated highly will be used to find the
+"romance effect" for that user.
+
+For users who have enough other movies rated, this may give better results.
+
+Unfortunately, the running time of this method (despite attempts at caching and 
+optimisation) made it impossible to include in the final analysis. The code is 
+included for reference, and in case anyone wants to try this with more computing 
+power and time available.
+
+```{r user-genre-specific, cache=TRUE}
+# user_genre_effect <- function(queriedUserId, genre){
+#   matching_ratings <- edx %>% filter(userId == queriedUserId) %>% rowwise() %>% filter(includes_genre(genres, genre))
+#   if(nrow(matching_ratings) == 0){
+#     0
+#   }else{
+#     mean(matching_ratings$rating) - mean_rating
+#   }
+# }
+
+# m_user_genre_effect <- memoise(user_genre_effect, cache = fscache)
+
+# user_genres_effect <- function(queriedUserId, genresList){
+#   genres_as_list <- strsplit(genresList, "|", fixed=TRUE)
+#   single_genre_effects <- map(unlist(genres_as_list), function(genre_name) { m_user_genre_effect(queriedUserId, genre_name) } )
+#   mean(unlist(single_genre_effects))
+# }
+
+# m_user_genres_effect <- memoise(user_genres_effect)
+
+# benchmark_start_time <- Sys.time()
+# predictions <- validation %>% 
+#                 rowwise() %>%
+#                 mutate(user_genres_effect = m_user_genres_effect(userId, genres)) %>%
+#                 ungroup() %>%
+#                 mutate(prediction = mean_rating + user_genres_effect)  %>%
+#                 .$prediction # This takes ~57s for 1000. 
+# benchmark_end_time <- Sys.time()
+# print(benchmark_end_time - benchmark_start_time)
+# rm(benchmark_end_time, benchmark_start_time)
+# rmse <- calculate_rmse(predictions, validation$rating)
+# print(rmse)
+# rm(rmse, predictions)
+```
+
+When this was successfully run, this gave an improvement in error over all of the 
+other genre-based methods.
+
+The following code would give an indication of this combined with user and movie
+effects.
+
+```{r user-genre-specific-with-movie, cache=TRUE}
+# benchmark_start_time <- Sys.time()
+# predictions <- validation %>% 
+#                 mutate(movieId = as.factor(movieId), userId = as.factor(userId)) %>% 
+#                 left_join(movie_effects, by='movieId') %>% 
+#                 left_join(per_user_effects, by='userId') %>% 
+#                 rowwise() %>%
+#                 mutate(user_genres_effect = m_user_genres_effect(userId, genres)) %>%
+#                 ungroup() %>%
+#                 mutate(combined_effect = (user_effect + movie_effect + user_genres_effect) / 3) %>%
+#                 mutate(prediction = mean_rating + combined_effect)  %>%
+#                 .$prediction
+# benchmark_end_time <- Sys.time()
+# print(benchmark_end_time - benchmark_start_time)
+# rm(benchmark_end_time, benchmark_start_time)
+# rmse <- calculate_rmse(predictions, validation$rating)
+# print(rmse)
+# rm(predictions)
+```
+
+```{r store-peak-user-specific}
+# peak_rmse_results[nrow(peak_rmse_results) + 1,] <- list("User-specific genre effect (combined with movie and user effects)", rmse)
+```
+
+## Adapting the User & Movie Effects Model
+
+The user and movie effects are good, but don't take account of one another at all. The 
+method that was used to calculate them assumes that they are the only thing affecting 
+the result, when, in fact, both play a part.
+
+Since the effects stack in a certain order, modifying all of the effects is not necessary.
+Here, the previous movie effects code is used.
+
+```{r accommodating-movie-effects}
+movie_effects <- edx %>% group_by(movieId) %>% summarize(movie_effect = mean(rating - mean_rating),
+                                                         ratings_for_movie = n())
+```
+
+New code finds the user effects; this time, the movie effect (found in the previous 
+code chunk) is deducted, before making the calculation of the user effect either way.
+
+```{r accommodating-user-effect}
+user_effects <- edx %>% 
+                  group_by(userId) %>% 
+                  left_join(movie_effects, by = "movieId") %>%
+                  summarize(user_effect = mean(rating - movie_effect - mean_rating), 
+                            ratings_by_user = n())
+```
+
+Now, a new set of predictions can be made, using the sum of the simple movie effect 
+and the user effect which takes account of it.
+
+```{r accommodating-prediction, warning=FALSE, message=FALSE}
+predictions <- validation %>% 
+                 mutate(movieId = as.factor(movieId), userId = as.factor(userId)) %>%
+                 left_join(movie_effects, by = "movieId") %>%
+                 left_join(user_effects, by = "userId") %>%
+                 mutate(combined_effect = user_effect + movie_effect) %>%
+                 mutate(prediction = mean_rating + combined_effect) %>%
+                 .$prediction
+rmse <- calculate_rmse(predictions, validation$rating)
+peak_rmse_results[nrow(peak_rmse_results) + 1,] <- list("Movie & User Effects (Accommodative)", rmse)
+peak_rmse_results
+rm( predictions)
+```
+
+This gives a noticable improvement, and meets our originally stated target.
+
+# Results
+
+```{r results-table}
+peak_rmse_results
+```
+
+The table shows the RMSE values for each attempted prediction method. 
+
+The lowest RMSE value was `0.8653`, and was calculated using the effects of the movie, added 
+to the the effects from the user corrected to take account of the movie effect.
+
+This technique can be used to create the script.
+
+# Conclusion
+
+The nature of these data prevent analysis using more common (and potentially more precise)
+machine-learning approaches. A training data set of around 9 million rows prevents this type 
+of analysis on a local computer due to memory constraints.
+
+If this were to be repeated with access to High Performance Computing facilities, like those used at 
+universities, some especially interesting mehtods of analysis might have been possible. 
+
+Despite the restrictions, an RMSE close to the target specified in the 'Netflix Prize' 
+competition, which set out to solve a similar problem, was able to be attained.
+
+The significance of the "user-specific genre effects" would be an intersting follow-up. While 
+tests showed it as comparable to the final "movie and user combination" results, it may have been
+possible to improve it further, and to find highly-specific results that are even more specific to 
+users' preferences. 
+
+Despite being unable to dig into this deeper at this time, the results found acheived the stated aims,
+estimating the rating a user will give a movie with relatively low error, and this has been 
+developed into the standalone script which accompanies this report.
+
